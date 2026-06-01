@@ -21,13 +21,22 @@ FastAPI + LangGraph 构建的创作流后端，调用 DeepSeek 生成结构化�
 apps/api/
 ├── main.py                 # FastAPI app + /generate SSE 端点
 ├── schemas.py              # Pydantic 模型（GenerationInput / XhsNote / GenerationOutput）
-├── settings.py             # 环境变量（DeepSeek + 可选 Supabase）
+├── settings.py             # 环境变量（DeepSeek + 可选 Supabase + 可选 Embedding）
 ├── db.py                   # Supabase 客户端 + save_generation（无配置时 no-op）
 ├── graphs/
-│   └── creation.py         # 创作 workflow（带重试 + schema 校验）
+│   └── creation.py         # 创作 workflow（retrieve → generate，带重试 + schema 校验）
 ├── prompts/
-│   ├── system.py           # 组装 system prompt（拼方法论）
-│   └── methodology.md      # 内置通用方法论，长 prefix 用于 DeepSeek 自动 Context Caching
+│   ├── system.py           # 组装 system prompt（拼方法论 / 注入检索结果）
+│   └── methodology.md      # 内置通用方法论，约 300 行
+├── rag/                    # v1.1：方法论 RAG
+│   ├── chunker.py          # 按 ### 切 markdown；硬规则与自检清单不切
+│   ├── embedder.py         # OpenAI-compat embedding 客户端（默认走智谱）
+│   └── store.py            # Supabase pgvector CRUD + 检索 RPC 调用
+├── scripts/
+│   └── ingest_methodology.py   # 一次性 chunk + embed + 入库
+├── supabase/
+│   └── migrations/
+│       └── 0001_methodology_chunks.sql   # pgvector 表 + search RPC
 ├── tests/                  # pytest
 ├── pyproject.toml          # ruff + pytest + mypy 配置
 ├── requirements.txt
@@ -54,7 +63,7 @@ uvicorn main:app --reload --port 8000
 
 ```bash
 curl http://localhost:8000/health
-# {"ok":true,"version":"1.0.0","supabase":false}
+# {"ok":true,"version":"1.1.0","supabase":false,"rag":false}
 ```
 
 调用生成端点（流式 SSE）：
@@ -120,7 +129,7 @@ mypy .
 
 ### `GET /health`
 
-返回 `{"ok": true, "version": "1.0.0", "supabase": <bool>}`，可作为部署探针。`supabase` 字段反映是否已配置持久化。
+返回 `{"ok": true, "version": "1.1.0", "supabase": <bool>, "rag": <bool>}`，可作为部署探针。`supabase` 反映持久化是否开启；`rag` 反映方法论 RAG 检索是否开启（需要同时配 Supabase + Embedding）。
 
 ---
 
@@ -137,8 +146,15 @@ mypy .
 | `DEEPSEEK_MAX_TOKENS` | | `4096` | 单次响应最大 token |
 | `DEEPSEEK_TIMEOUT_SECONDS` | | `60` | 单次 API 超时 |
 | `DEEPSEEK_RETRY_MAX` | | `2` | schema 校验失败时重试次数 |
-| `SUPABASE_URL` | | | 可选；不填就跳过持久化 |
-| `SUPABASE_SERVICE_KEY` | | | 可选；同上（**不要泄漏**） |
+| `SUPABASE_URL` | | | 可选；不填就跳过持久化；启用 RAG 时必填 |
+| `SUPABASE_SERVICE_KEY` | | | 同上（**不要泄漏**） |
+| `EMBEDDING_API_KEY` | | | v1.1 可选；不填则回退到 v1.0 硬编码方法论 |
+| `EMBEDDING_BASE_URL` | | `https://open.bigmodel.cn/api/paas/v4` | 默认走智谱 BigModel，OpenAI/阿里都兼容 |
+| `EMBEDDING_MODEL` | | `embedding-3` | |
+| `EMBEDDING_DIMENSIONS` | | `1024` | 必须和 SQL 迁移里 `vector(N)` 一致 |
+| `EMBEDDING_TIMEOUT_SECONDS` | | `20` | |
+| `RAG_TOP_K` | | `8` | 检索 top-k |
+| `RAG_MIN_SIMILARITY` | | `0.30` | 相似度阈值；低于会被过滤 |
 | `CORS_ALLOW_ORIGINS` | | `*` | 生产环境建议填具体域名（逗号分隔） |
 
 ---
@@ -158,6 +174,28 @@ create table generations (
 ```
 
 不配置 Supabase 也能完整运行，写入会安静地 no-op。
+
+---
+
+## 方法论 RAG（v1.1 可选）
+
+启用后，把 `methodology.md` 里的"套路 / 反面案例 / 特殊场景 / 底层逻辑"四类内容搬到 pgvector，按用户输入动态检索 top-k 注入。硬规则与自检清单始终留在 system prompt（稳定缓存）。
+
+**启用步骤**：
+
+1. 跑迁移：在 Supabase SQL 编辑器执行 [supabase/migrations/0001_methodology_chunks.sql](supabase/migrations/0001_methodology_chunks.sql)。文件里默认 `vector(1024)` 对应智谱 `embedding-3` + `dimensions=1024`；改维度记得同步改 SQL
+2. `.env` 至少配 `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` / `EMBEDDING_API_KEY`
+3. 入库：
+
+   ```bash
+   cd apps/api
+   python -m scripts.ingest_methodology --reset
+   ```
+
+4. 验证：`/health` 返回 `"rag": true`；首次 `/generate` 日志会打印 `RAG retrieved N chunks`
+5. 改 `methodology.md` 后重跑 `--reset` 即可
+
+**不启用**时（不配置上述 env 或没跑 SQL），LangGraph 的 `retrieve` 节点静默 no-op，整份方法论照旧塞 system prompt（= v1.0 行为）。
 
 ---
 

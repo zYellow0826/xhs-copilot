@@ -31,21 +31,28 @@
 ### 方法论知识库 (v1.1+)
 
 ```sql
+create extension if not exists vector;
+
 create table methodology_chunks (
-  id          uuid primary key default gen_random_uuid(),
+  id          bigserial primary key,
+  category    text not null,                -- 一、底层逻辑 / 三、套路 / 四、反面案例 / 五、特殊场景
+  section     text not null,                -- ### 子标题，例如 "1. 选题方法论"
   content     text not null,
-  embedding   vector(1024) not null,    -- voyage-3 是 1024 维
-  category    text,                      -- 选题/标题/封面/数据等
-  source_doc  text,                      -- 来源文档名，便于回溯
-  metadata    jsonb default '{}',
-  created_at  timestamptz default now()
+  metadata    jsonb default '{}'::jsonb,
+  embedding   vector(1024) not null,        -- 默认匹配智谱 embedding-3 (dimensions=1024)
+  created_at  timestamptz default now(),
+  updated_at  timestamptz default now()
 );
 
-create index on methodology_chunks using ivfflat (embedding vector_cosine_ops);
+create index on methodology_chunks (category);
+create index on methodology_chunks using ivfflat (embedding vector_cosine_ops) with (lists = 100);
 ```
 
-- **写入**：后台管理页（对象用），Markdown 文件按规则切分
-- **读取**：LangGraph retriever 节点，top-k = 5-8
+外加一个 `search_methodology_chunks` RPC 做余弦相似度检索（见 `apps/api/supabase/migrations/0001_methodology_chunks.sql`）。
+
+- **写入**：`apps/api/scripts/ingest_methodology.py` 一次性 chunk + embed + upsert；改完 markdown 重跑 `--reset` 即可
+- **读取**：LangGraph `retrieve` 节点，top-k 默认 8，相似度阈值默认 0.30
+- **重要**：硬规则与自检清单**不参与检索**，始终在 system prompt 头部，保证 Context Caching 高命中率 + 防止 retrieval 漏掉关键约束
 
 ### 店铺 Memory (v1.4+)
 
@@ -96,6 +103,8 @@ create table shops (
 
 **v1.0 缩水版**：intake → writer → return，retrieve 用 prompt 硬编码替代，没有 judge。
 
+**v1.1 现状**：retrieve_node → writer_node → return。Retrieve 拉 pgvector 检索结果，writer 用"硬规则 + 自检清单"（system prompt 头部，稳定缓存）+ "检索到的套路与反面案例"（user message 内）组合调用 DeepSeek。当 `EMBEDDING_API_KEY` 或 Supabase 缺失时自动降级为 v1.0 行为（硬编码全文 system prompt），零回归。
+
 ---
 
 ## 诊断 Workflow（v1.3）
@@ -121,7 +130,7 @@ generate_report      ─►  输出可执行建议
 | Streaming | `graph.astream_events(version="v2")` + SSE | 前端能展示"当前 agent 在做什么"，体验和教育属性都拉满 |
 | 数据获取（诊断） | 手动粘贴 → 后期浏览器插件 | 反爬绕不过去，先把核心价值交付 |
 | 模型策略 | DeepSeek V3 (`deepseek-chat`) 主力 + R1 (`deepseek-reasoner`) 备用 | V3 便宜快(~¥2/M)，适合主创作；R1 留给 v1.2 judge / 复杂推理场景。Context Caching 自动命中长 prefix(方法论)，无需手动 `cache_control` 标记 |
-| Embedding | voyage-3 (1024d) | 中文质量好于 OpenAI，价格便宜 |
+| Embedding | 智谱 `embedding-3` (默认 1024d，OpenAI 兼容) | 中文质量好、便宜、走 HTTP API 无需本地 GPU；可自由切换 OpenAI / 阿里 |
 | 部署 | Vercel (web) + Railway (api) + Supabase (db) | 零运维副业最优解 |
 
 ---

@@ -15,8 +15,8 @@
 
 | 版本 | 能力 | 状态 |
 |---|---|---|
-| **v1.0** | 创作流：表单输入 → 1-3 篇小红书笔记（标题 + 正文 + 标签 + 封面文案）+ 选题思路解释 | ✅ 当前 |
-| v1.1 | 方法论从 prompt 搬到向量库，支持后台维护条目 | 规划中 |
+| **v1.0** | 创作流：表单输入 → 1-3 篇小红书笔记（标题 + 正文 + 标签 + 封面文案）+ 选题思路解释 | ✅ |
+| **v1.1** | 方法论 RAG 化：套路 / 反面案例 / 特殊场景搬到 pgvector，按用户输入动态检索 top-k；硬规则与自检清单仍在 system prompt 保证 Context Caching | ✅ 当前 |
 | v1.2 | 生成结果自动评分 + 不及格自动改写（Reflection 循环） | 规划中 |
 | v1.3 | 账号诊断流：粘贴笔记 → 出诊断报告 + 改进建议 | 规划中 |
 | v1.4 | 多账号 Memory：每个店铺独立画像与历史 | 规划中 |
@@ -108,8 +108,14 @@ curl http://localhost:8000/health
 | `DEEPSEEK_MAX_TOKENS` | | 默认 `4096` |
 | `DEEPSEEK_TIMEOUT_SECONDS` | | 默认 `60` |
 | `DEEPSEEK_RETRY_MAX` | | 校验失败重试次数，默认 `2` |
-| `SUPABASE_URL` | | 可选；不填就跳过持久化 |
+| `SUPABASE_URL` | | 可选；不填就跳过持久化；启用 RAG 时必填 |
 | `SUPABASE_SERVICE_KEY` | | 同上 |
+| `EMBEDDING_API_KEY` | | v1.1 可选；不填则回退到 v1.0 硬编码方法论 |
+| `EMBEDDING_BASE_URL` | | 默认智谱 `https://open.bigmodel.cn/api/paas/v4`，OpenAI/阿里都兼容 |
+| `EMBEDDING_MODEL` | | 默认 `embedding-3`（智谱） |
+| `EMBEDDING_DIMENSIONS` | | 默认 `1024`，需要与 SQL 迁移里 `vector(N)` 一致 |
+| `RAG_TOP_K` | | 检索数量，默认 `8` |
+| `RAG_MIN_SIMILARITY` | | 相似度阈值（0-1），默认 `0.30` |
 | `CORS_ALLOW_ORIGINS` | | 默认 `*`，生产建议填具体域名（逗号分隔） |
 
 ### 前端（apps/web/.env.local）
@@ -125,6 +131,25 @@ curl http://localhost:8000/health
 ## 自定义方法论
 
 [apps/api/prompts/methodology.md](apps/api/prompts/methodology.md) 是 prompt 质量的核心。本仓库内置了一份**通用版**，覆盖选题、标题、正文、标签、封面、违禁词、对标爆款套路，约 300 行。
+
+文件按 `## 二、硬规则` / `## 六、生成时的自检清单` 等结构组织：
+
+- **硬规则 + 自检清单**：始终留在 system prompt（稳定前缀，Context Caching 命中率最高），不参与检索
+- **底层逻辑 / 套路 / 反面案例 / 特殊场景**：v1.1 起会被 chunk → embed → 写入 pgvector，按用户输入动态检索 top-k 注入到 user message
+- **未启用 RAG 时**：整份方法论照旧塞进 system prompt（v1.0 行为，零回归）
+
+启用 RAG（可选）：
+
+1. 在 Supabase SQL 编辑器跑 [apps/api/supabase/migrations/0001_methodology_chunks.sql](apps/api/supabase/migrations/0001_methodology_chunks.sql)
+2. 在 `.env` 配置 `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` / `EMBEDDING_API_KEY`（默认走智谱 BigModel）
+3. 入库：
+
+   ```bash
+   cd apps/api
+   python -m scripts.ingest_methodology --reset
+   ```
+
+4. 改方法论 → 重跑 `python -m scripts.ingest_methodology --reset` 即可
 
 替换为你自己的方法论：
 

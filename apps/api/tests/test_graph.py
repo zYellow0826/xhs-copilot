@@ -31,6 +31,7 @@ def test_build_graph_structure():
     # compiled graph exposes the node names
     nodes = set(g.get_graph().nodes)
     assert "generate" in nodes
+    assert "retrieve" in nodes
 
 
 def test_generate_node_happy_path(monkeypatch):

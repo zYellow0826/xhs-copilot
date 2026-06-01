@@ -1,8 +1,12 @@
-"""Creation workflow — v1.0.
+"""Creation workflow — v1.1.
 
-Single-node LangGraph:
+LangGraph:
 
-    START → generate → END
+    START → retrieve → generate → END
+
+`retrieve` (new in v1.1): embeds the user input and pulls top-k methodology
+chunks from pgvector. No-op when RAG is disabled — the system prompt then
+contains the full hardcoded methodology (v1.0 behaviour).
 
 `generate` calls DeepSeek with a forced `submit_notes` tool call and validates
 the structured payload through `GenerationOutput`. If the model returns
@@ -21,7 +25,7 @@ from langgraph.graph import END, START, StateGraph
 from openai import APIError, APITimeoutError, OpenAI, RateLimitError
 from pydantic import ValidationError
 
-from prompts.system import SYSTEM_PROMPT
+from prompts.system import SYSTEM_PROMPT_NO_RAG, SYSTEM_PROMPT_RAG, build_user_message
 from schemas import GenerationInput, GenerationOutput
 from settings import settings
 
@@ -34,8 +38,9 @@ client = OpenAI(
 )
 
 
-class CreationState(TypedDict):
+class CreationState(TypedDict, total=False):
     input: GenerationInput
+    retrieved_chunks: list[dict] | None
     output: GenerationOutput | None
 
 
@@ -88,10 +93,58 @@ def _call_model(messages: list[dict]) -> GenerationOutput:
     return GenerationOutput.model_validate_json(raw_args)
 
 
+def _build_retrieval_query(payload: GenerationInput) -> str:
+    parts = [
+        payload.shop_type,
+        payload.style_preference,
+        payload.target_audience,
+        payload.product_info,
+    ]
+    if payload.extra_context:
+        parts.append(payload.extra_context)
+    return " ".join(p for p in parts if p)
+
+
+def retrieve_node(state: CreationState) -> CreationState:
+    """Embed input → search pgvector → stash top-k chunks in state.
+
+    When RAG is disabled or anything fails, return state with
+    retrieved_chunks=None so the prompt builder falls back to the full
+    hardcoded methodology.
+    """
+    if not settings.rag_enabled:
+        return {**state, "retrieved_chunks": None}
+
+    try:
+        # Lazy imports — keep the graph importable even if the packages
+        # aren't installed in fallback environments.
+        from rag import embedder, store
+    except ImportError as exc:
+        log.warning("RAG modules unavailable, falling back: %s", exc)
+        return {**state, "retrieved_chunks": None}
+
+    payload = state["input"]
+    query = _build_retrieval_query(payload)
+    try:
+        query_vec = embedder.embed_query(query)
+    except Exception as exc:
+        log.warning("embedding failed, falling back to hardcoded methodology: %s", exc)
+        return {**state, "retrieved_chunks": None}
+
+    hits = store.search(query_vec)
+    log.info("RAG retrieved %d chunks for query=%r", len(hits), query[:80])
+    chunks = [h.to_payload() for h in hits]
+    return {**state, "retrieved_chunks": chunks}
+
+
 def generate_node(state: CreationState) -> CreationState:
+    retrieved = state.get("retrieved_chunks")
+    system_prompt = SYSTEM_PROMPT_RAG if retrieved else SYSTEM_PROMPT_NO_RAG
+    user_message = build_user_message(state["input"], retrieved)
+
     base_messages: list[dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": state["input"].model_dump_json()},
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
     ]
     messages = list(base_messages)
 
@@ -137,7 +190,9 @@ def generate_node(state: CreationState) -> CreationState:
 
 def build_graph():
     g = StateGraph(CreationState)
+    g.add_node("retrieve", retrieve_node)
     g.add_node("generate", generate_node)
-    g.add_edge(START, "generate")
+    g.add_edge(START, "retrieve")
+    g.add_edge("retrieve", "generate")
     g.add_edge("generate", END)
     return g.compile()

@@ -27,7 +27,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("xhs-copilot")
 
-app = FastAPI(title="xhs-copilot api", version="1.0.0")
+app = FastAPI(title="xhs-copilot api", version="1.1.0")
 
 _origins = [o.strip() for o in settings.CORS_ALLOW_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
@@ -59,6 +59,7 @@ def health() -> dict[str, Any]:
         "ok": True,
         "version": app.version,
         "supabase": settings.supabase_enabled,
+        "rag": settings.rag_enabled,
     }
 
 
@@ -68,7 +69,7 @@ async def generate(payload: GenerationInput) -> StreamingResponse:
         final_output = None
         try:
             async for event in graph.astream_events(
-                {"input": payload, "output": None}, version="v2"
+                {"input": payload, "retrieved_chunks": None, "output": None}, version="v2"
             ):
                 yield _sse(event)
                 if (
